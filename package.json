@@ -1,0 +1,17 @@
+{
+  "name": "campus-mental-support-resources",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node mcp-server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.26.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.0"
+  }
+}
