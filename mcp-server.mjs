@@ -13,6 +13,7 @@ const data = JSON.parse(await readFile(dataPath, "utf8"));
 const faqData = JSON.parse(await readFile(faqPath, "utf8"));
 const faqs = Array.isArray(faqData.items) ? faqData.items : [];
 const port = Number(process.env.PORT || 10000);
+const visionConfidenceThreshold = 0.75;
 
 // Expand common campus-support wording so queries do not depend on one exact phrase.
 const synonymGroups = [
@@ -94,10 +95,103 @@ function formatFaqs(items) {
   ].join("\n\n");
 }
 
+function normalizeHand(value = "") {
+  const normalized = normalizeText(value);
+  if ([
+    "right", "r", "右", "右手", "右臂", "right_hand", "righthand",
+    "right_hand_raised", "raised_right_hand", "raise_right_hand", "举右手", "右手举起"
+  ].includes(normalized)) {
+    return "right";
+  }
+  if ([
+    "left", "l", "左", "左手", "左臂", "left_hand", "lefthand",
+    "left_hand_raised", "raised_left_hand", "raise_left_hand", "举左手", "左手举起"
+  ].includes(normalized)) {
+    return "left";
+  }
+  if (["none", "无", "没有", "未识别", "unknown", "不确定", "未知"].includes(normalized)) {
+    return "unknown";
+  }
+  return "unknown";
+}
+
+function normalizeGesture(value = "raised_hand") {
+  const normalized = normalizeText(value);
+  if ([
+    "raised_hand", "raisedhand", "举手", "举起手", "举手动作", "举手示意",
+    "举起右手", "举起左手", "右手举起", "左手举起",
+    "right_hand_raised", "left_hand_raised", "raised_right_hand", "raised_left_hand"
+  ].includes(normalized)) {
+    return "raised_hand";
+  }
+  if (["pointing", "point", "指向", "指路", "指示"].includes(normalized)) {
+    return "pointing";
+  }
+  return "unknown";
+}
+
+function isDirectionQuestion(question = "") {
+  const normalized = normalizeText(question);
+  const locationTerms = ["寝室", "宿舍", "宿舍楼", "寝室楼"];
+  const directionTerms = ["这边", "这里", "这儿", "哪边", "哪里", "在哪", "方向", "怎么走"];
+  return locationTerms.some((term) => normalized.includes(term))
+    && directionTerms.some((term) => normalized.includes(term));
+}
+
+function formatHand(hand) {
+  return hand === "right" ? "右" : "左";
+}
+
+function buildVisualBridgeReply({ question = "", raisedHand = "unknown", gesture = "raised_hand", confidence = 1 }) {
+  const numericConfidence = Number(confidence);
+  const safeConfidence = Number.isFinite(numericConfidence) ? numericConfidence : 0;
+
+  if (safeConfidence < visionConfidenceThreshold) {
+    return "我暂时不能确定你的动作，请把手放在镜头前并再做一次明显的举手动作。";
+  }
+
+  if (!["raised_hand", "pointing"].includes(gesture)) {
+    return "我暂时只识别到一个不明确的动作，请再做一次举手或指向动作。";
+  }
+
+  const hand = normalizeHand(raisedHand);
+  if (hand === "unknown") {
+    return "我暂时没有可靠识别到你举的是哪只手，请再试一次。";
+  }
+
+  if (isDirectionQuestion(question)) {
+    const oppositeHand = hand === "right" ? "left" : "right";
+    return `不是的，在你的${formatHand(oppositeHand)}手。`;
+  }
+
+  return `我识别到你举起了${formatHand(hand)}手。请再说一下要确认的地点或方向。`;
+}
+
+function parseVisualObservation(payload = {}) {
+  const question = typeof payload.question === "string" ? payload.question.trim() : "";
+  const gesture = normalizeGesture(
+    typeof payload.gesture === "string" ? payload.gesture.trim().toLowerCase() : "raised_hand"
+  );
+  const raisedHand = typeof payload.raised_hand === "string"
+    ? payload.raised_hand
+    : typeof payload.hand === "string"
+      ? payload.hand
+      : "unknown";
+  const confidence = payload.confidence === undefined ? 1 : Number(payload.confidence);
+
+  return {
+    question,
+    gesture,
+    raisedHand,
+    confidence,
+    reply: buildVisualBridgeReply({ question, raisedHand, gesture, confidence })
+  };
+}
+
 function createServer() {
   const server = new McpServer({
     name: "xiaoyingxing-campus-mental-support",
-    version: "1.1.0"
+    version: "1.2.0"
   });
 
   server.registerTool(
@@ -131,6 +225,26 @@ function createServer() {
     }
   );
 
+  server.registerTool(
+    "bridge_visual_observation",
+    {
+      description: "接收外部视觉助手输出的结构化动作结果，并生成简短的校园方向回复。适用于用户打开摄像头、举手或指向后询问寝室/宿舍方向的场景。视觉助手应传入 question、raised_hand、gesture 和 confidence；置信度低于 0.75 时不会给出确定方向。只处理可见动作和相对方向，不进行情绪识别、心理诊断或危机判定。",
+      inputSchema: {
+        question: z.string().min(1).describe("用户正在询问的问题，例如：寝室在这边吗"),
+        raised_hand: z.string().optional().describe("视觉助手识别的手，例如 right、left、右手或左手"),
+        hand: z.string().optional().describe("raised_hand 的兼容字段；外部视觉助手可传 right 或 left"),
+        gesture: z.string().optional().describe("动作类型，支持 raised_hand 或 pointing"),
+        confidence: z.number().min(0).max(1).optional().describe("视觉识别置信度，0 到 1；低于 0.75 时请求用户重试")
+      }
+    },
+    async (payload) => {
+      const observation = parseVisualObservation(payload);
+      return {
+        content: [{ type: "text", text: observation.reply }]
+      };
+    }
+  );
+
   return server;
 }
 
@@ -138,7 +252,23 @@ const app = express();
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "xiaoyingxing-campus-mental-support-mcp", version: "1.1.0" });
+  res.json({ ok: true, service: "xiaoyingxing-campus-mental-support-mcp", version: "1.2.0" });
+});
+
+// 外部视觉助手桥接入口。只保留本次请求的结构化结果，不保存原始图像或视频。
+app.post("/api/v1/vision/observation", (req, res) => {
+  const payload = req.body && typeof req.body === "object" ? req.body : {};
+  const observation = parseVisualObservation(payload);
+  res.json({
+    ok: true,
+    reply: observation.reply,
+    observation: {
+      question: observation.question,
+      gesture: observation.gesture,
+      raised_hand: normalizeHand(observation.raisedHand),
+      confidence: Number.isFinite(observation.confidence) ? observation.confidence : 0
+    }
+  });
 });
 
 app.post("/mcp", async (req, res) => {
